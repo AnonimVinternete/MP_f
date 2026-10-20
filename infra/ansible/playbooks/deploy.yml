@@ -1,0 +1,12 @@
+# Полный деплой: пакеты → Docker → код → .env → docker compose up.
+# Повторный запуск безопасен: то, что уже сделано, пропускается.
+- name: Deploy MP
+  hosts: "{{ target | default('mp') }}"
+  become: true
+
+  roles:
+    - common
+    - docker
+    - sync
+    - env
+    - start

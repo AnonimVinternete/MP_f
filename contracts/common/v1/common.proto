@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package common.v1;
+
+// Контекст запроса. Заполняет ТОЛЬКО Gateway; первое поле каждого запроса.
+// Авторизации в продукте нет (по ТЗ): используется request_id — сквозной id для логов.
+// actor_* оставлены на будущее (если появятся пользователи) и сейчас пустые.
+message RequestContext {
+  string request_id = 1;
+  string actor_user_id = 2;
+  // "user" | "admin"
+  string actor_role = 3;
+}

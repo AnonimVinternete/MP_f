@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "МедиаПульс — проверить пост",
+  "short_name": "МедиаПульс",
+  "description": "Выделите текст поста — и узнайте, где ещё его опубликовали в Красноярском крае.",
+  "version": "0.2.0",
+  "minimum_chrome_version": "116",
+  "action": { "default_title": "МедиаПульс: найти размещения", "default_popup": "popup.html" },
+  "options_page": "options.html",
+  "background": { "service_worker": "background.js", "type": "module" },
+  "permissions": ["contextMenus", "storage", "activeTab", "scripting", "alarms"],
+  "host_permissions": ["__SERVER__/*"],
+  "optional_host_permissions": ["<all_urls>"]
+}

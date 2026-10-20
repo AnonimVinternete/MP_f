@@ -1,0 +1,183 @@
+name: mp
+
+services:
+  # ───────── вход снаружи ─────────
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-80}:80" # nginx: статика фронта + прокси /api, /docs → gateway
+    depends_on:
+      - gateway
+
+  gateway:
+    build:
+      context: .
+      dockerfile: services/gateway/Dockerfile
+    restart: unless-stopped
+    environment:
+      SEARCH_GRPC_TARGET: search_service:50053
+      COLLECTOR_GRPC_TARGET: collector_service:50054
+      ML_GRPC_TARGET: ml_service:50055
+    ports:
+      - "8000:8000" # Swagger: http://localhost:8000/docs
+    depends_on:
+      - search_service
+      - collector_service
+      - ml_service
+
+  # ───────── ядро: источники, поиски, подборка (B2) ─────────
+  search_service:
+    build:
+      context: .
+      dockerfile: services/search_service/Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+asyncpg://search:${SEARCH_DB_PASSWORD:-search_local}@search_db:5432/search
+      COLLECTOR_GRPC_TARGET: collector_service:50054
+      ML_GRPC_TARGET: ml_service:50055
+      # false — не показывать «ML работал в упрощённом режиме» (эвристики), ML-15
+      ML_SHOW_DEGRADED_WARNING: ${ML_SHOW_DEGRADED_WARNING:-true}
+      # очередь поисков (B2-15): сколько поисков идёт одновременно (модели на одной видеокарте)
+      SEARCH_MAX_PARALLEL: ${SEARCH_MAX_PARALLEL:-1}
+      # кэш в Redis (B2-20): CACHE_ENABLED=false — выключен, всё как до кэша
+      CACHE_ENABLED: ${CACHE_ENABLED:-true}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      CACHE_SEARCH_TTL_SECONDS: ${CACHE_SEARCH_TTL_SECONDS:-1800} # готовая подборка
+    ports:
+      - "127.0.0.1:50053:50053"
+    depends_on:
+      search_db:
+        condition: service_healthy
+      collector_service:
+        condition: service_started
+      ml_service:
+        condition: service_started
+      # Redis упал — поиск работает без кэша (fail-open), поэтому только «запущен», не «здоров»
+      redis:
+        condition: service_started
+
+  search_db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: search
+      POSTGRES_USER: search
+      POSTGRES_PASSWORD: ${SEARCH_DB_PASSWORD:-search_local}
+    ports:
+      - "127.0.0.1:5435:5432"
+    volumes:
+      - search_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U search -d search"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ───────── кэш (B2-20): готовые подборки и сбор с площадок ─────────
+  # Только кэш: на диск не пишем (--save ""), при нехватке памяти вытесняем старое (allkeys-lru).
+  # Наружу порт не публикуем. Сбросить: make cache-flush
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --maxmemory ${REDIS_MAXMEMORY:-256mb} --maxmemory-policy allkeys-lru --save ""
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ───────── получение публикаций (B1), без БД ─────────
+  collector_service:
+    build:
+      context: .
+      dockerfile: services/collector_service/Dockerfile
+    restart: unless-stopped
+    environment:
+      COLLECTOR_FAKE: ${COLLECTOR_FAKE:-false} # true — тестовые посты [FAKE], НЕ для демо
+      VK_SERVICE_TOKEN: ${VK_SERVICE_TOKEN:-}
+      # токен VK ID (python3 scripts/vk_token.py): сборщик сам обновляет его каждый час
+      VK_TOKEN_FILE: /vk/token.json
+      YC_FOLDER_ID: ${YC_FOLDER_ID:-}
+      YC_SEARCH_API_KEY: ${YC_SEARCH_API_KEY:-}
+      # MAX Bot API (B1-11): токен бота; бот — администратор каналов, которые собираем
+      MAX_BOT_TOKEN: ${MAX_BOT_TOKEN:-}
+      MAX_API_URL: ${MAX_API_URL:-https://platform-api2.max.ru}
+      # корневой сертификат Минцифры для TLS к MAX: положить PEM в infra/certs/ и указать
+      # HTTP_CA_BUNDLE=/certs/<файл>.pem (пусто — только certifi и системные корни)
+      HTTP_CA_BUNDLE: ${HTTP_CA_BUNDLE:-}
+      # новостные сайты (B1-15): без значения — встроенный перечень (infra/config.py);
+      # задать в .env: NEWS_SITES='хост|адрес RSS|Название; …' — сайт добавляется без правки кода
+      NEWS_SITES:
+      NEWS_OPEN_ARTICLES:
+      # сколько постов на одну цель уходит в ML: локальная модель проверяет ~3 поста/с на всех
+      DEFAULT_MAX_POSTS_SEARCH: ${DEFAULT_MAX_POSTS_SEARCH:-200} # «везде» по площадке
+      DEFAULT_MAX_POSTS_SOURCE: ${DEFAULT_MAX_POSTS_SOURCE:-150} # стена одного источника
+      # кэш в Redis (B2-20): CACHE_ENABLED=false — выключен, всё как до кэша
+      CACHE_ENABLED: ${CACHE_ENABLED:-true}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      CACHE_COLLECT_TTL_SECONDS: ${CACHE_COLLECT_TTL_SECONDS:-600} # посты источника / поиск по площадке
+      CACHE_RESOLVE_TTL_SECONDS: ${CACHE_RESOLVE_TTL_SECONDS:-600} # карточка источника по ссылке
+    volumes:
+      - ./.vk:/vk
+      - ./infra/certs:/certs:ro
+    ports:
+      - "127.0.0.1:50054:50054"
+    depends_on:
+      redis:
+        condition: service_started
+
+  # ───────── анализ текста (ML), без БД ─────────
+  ml_service:
+    build:
+      context: .
+      dockerfile: services/ml_service/Dockerfile
+    restart: unless-stopped
+    environment:
+      # цепочка по порядку: ollama,yandex — ноут, потом Яндекс, потом эвристики (ML-15)
+      LLM_PROVIDER: ${LLM_PROVIDER:-stub}
+      EMBED_PROVIDER: ${EMBED_PROVIDER:-} # пусто — как LLM_PROVIDER
+      YC_FOLDER_ID: ${YC_FOLDER_ID:-}
+      YC_API_KEY: ${YC_API_KEY:-}
+      # Yandex AI Studio (LLM_PROVIDER=yandex / EMBED_PROVIDER=yandex), пусто — значения по умолчанию
+      YC_LLM_MODEL: ${YC_LLM_MODEL:-yandexgpt-lite/latest}
+      YC_JUDGE_MODEL: ${YC_JUDGE_MODEL:-}
+      # пороги косинуса эмбеддингов — у каждого провайдера свои: SIM_* — bge-m3 (Ollama),
+      # SIM_*_YANDEX — Яндекс (до калибровки ML-11 те же, подобрать по eval)
+      SIM_LOW: ${SIM_LOW:-0.38}
+      SIM_HIGH: ${SIM_HIGH:-0.68}
+      SIM_RETELL: ${SIM_RETELL:-0.86}
+      SIM_LOW_YANDEX: ${SIM_LOW_YANDEX:-0.38}
+      SIM_HIGH_YANDEX: ${SIM_HIGH_YANDEX:-0.68}
+      SIM_RETELL_YANDEX: ${SIM_RETELL_YANDEX:-0.86}
+      # Ollama в compose (профиль llm-local) или на хосте: OLLAMA_URL=http://host.docker.internal:11434
+      # на сервере — ноут через туннель: http://host.docker.internal:11435 (Ansible, ML-15)
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      # ноут недоступен — понять за секунды (connect) и проверить /api/version после паузы
+      OLLAMA_CONNECT_TIMEOUT_SECONDS: ${OLLAMA_CONNECT_TIMEOUT_SECONDS:-3}
+      OLLAMA_LLM_MODEL: ${OLLAMA_LLM_MODEL:-qwen2.5:7b-instruct}
+      OLLAMA_JUDGE_MODEL: ${OLLAMA_JUDGE_MODEL:-}
+      OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-bge-m3}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:50055:50055"
+      # HTTP /health: какой провайдер сейчас отвечает (curl -s localhost:8085/health), только localhost
+      - "127.0.0.1:8085:8085"
+
+  # локальная LLM для разработки без ключей Яндекса:
+  #   docker compose --profile llm-local up -d ollama
+  #   docker compose exec ollama ollama pull qwen2.5:7b-instruct
+  #   docker compose exec ollama ollama pull bge-m3
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["llm-local"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+volumes:
+  search_db_data:
+  ollama_data:
